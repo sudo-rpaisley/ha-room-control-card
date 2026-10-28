@@ -2,6 +2,24 @@
 const escapeText = (value) => String(value ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const safeIcon = (value) => /^[a-z][a-z0-9_-]*:[a-z0-9_-]+$/.test(value||'') ? value : 'mdi:home-outline';
 
+// Shared registry fetches are read-only; never write Home Assistant's Area/Device/Entity registry.
+const REGISTRY_CACHE = new WeakMap();
+function fetchRegistries(hass, force=false) {
+  if (!hass?.callWS) return Promise.resolve(null);
+  const key=hass.connection && typeof hass.connection==='object' ? hass.connection : hass;
+  if (force) REGISTRY_CACHE.delete(key);
+  if (!REGISTRY_CACHE.has(key)) {
+    const request=Promise.all([
+      hass.callWS({type:'config/area_registry/list'}),
+      hass.callWS({type:'config/device_registry/list'}),
+      hass.callWS({type:'config/entity_registry/list'})
+    ]).then(([areas,devices,entities])=>({areas,devices,entities}))
+      .catch(error=>{REGISTRY_CACHE.delete(key);throw error;});
+    REGISTRY_CACHE.set(key,request);
+  }
+  return REGISTRY_CACHE.get(key);
+}
+
 const BASE_CSS = `
 :host { display:block; color:var(--primary-text-color); }
 ha-card { position:relative; background:var(--ha-card-background,var(--card-background-color)); border-radius:var(--ha-card-border-radius,16px); overflow:hidden; border:1px solid var(--divider-color); }
@@ -43,25 +61,37 @@ function indicatorMarkup(kind, status) {
 }
 
 class RoomControlCard extends HTMLElement {
-  constructor(){super();this.attachShadow({mode:'open'});this._more=false;this._touchLong=false;this._tapTimer=null;this._holdTimer=null;}
+  constructor(){super();this.attachShadow({mode:'open'});this._more=false;this._touchLong=false;this._tapTimer=null;this._holdTimer=null;this._registryPromise=null;this._registries=null;this._registryError=null;}
   static getStubConfig(){return {room:'kitchen'};}
   static getConfigElement(){return document.createElement('room-control-card-editor');}
   getCardSize(){return 3;}
   getGridOptions(){return {columns:6,min_columns:3,rows:3,min_rows:2};}
   setConfig(config){validateConfig(config);this._config={...config};this._render();}
-  set hass(value){this._hass=value;if(this._config)this._render();}
+  set hass(value){this._hass=value;this._loadRegistry();if(this._config)this._render();}
+  async _loadRegistry(){
+    if(this._registries || this._registryPromise || !this._hass?.callWS)return;
+    const hass=this._hass;
+    this._registryPromise=fetchRegistries(hass);
+    try{
+      const data=await this._registryPromise;
+      if(this._hass?.connection !== hass.connection)return;
+      this._registries=data;this._registryError=null;
+    }catch(error){
+      this._registryError=String(error?.message||error);
+    }finally{this._registryPromise=null;if(this._config)this._render();}
+  }
   _render(){
     if(!this.shadowRoot||!this._config)return;
     let model;
-    try {model=buildModel(this._config,this._hass);}catch(e){this.shadowRoot.innerHTML=`<style>${BASE_CSS}</style><ha-card><div class="info bad">${escapeText(e.message)}</div></ha-card>`;return;}
+    try {model=buildModel(this._config,this._hass,this._registries);}catch(e){this.shadowRoot.innerHTML=`<style>${BASE_CSS}</style><ha-card><div class="info bad">${escapeText(e.message)}</div></ha-card>`;return;}
     this._model=model;
     const m=model,roomColor=m.roomOn===true?'var(--primary-color,#ffd60a)':'#44739e';
     const showNight=m.profile.bedtime&&m.bedtime===true;
     const showFan=m.profile.fan&&m.fan===true;
-    const diagnostics=m.missing.map(x=>`${x.role}: ${x.quality} (${x.entity_id||'not configured'})`);
+    const diagnostics=m.missing.map(x=>`${x.role}: ${x.quality} (${x.entity_id||'not configured'})${x.candidates?.length?' — choose '+x.candidates.join(' or '):''}`);
     const essentials=['room_state','temperature','humidity',...(m.profile.vacuum?['vacuum_queue','vacuum_active']:[]),...(m.profile.mop?['mop_queue','mop_active']:[])];
     const essentialsMissing=essentials.filter(x=>m.diagnostic[x] && m.diagnostic[x].quality!=='ok' && m.diagnostic[x].quality!=='pending');
-    const health=essentialsMissing.length||m.vacuum.state==='blocked'||m.mop.state==='blocked'||m.mop.state==='uncertain'||m.mop.state==='readiness_unknown'||(m.diagnostic.robot?.quality==='ambiguous-or-missing'&&(m.vacuum.state==='queued'||m.mop.state!=='disabled'&&m.mop.state!=='idle'));
+    const health=(this._config.area_id && m.area.quality==='missing')||m.area.quality==='ambiguous'||essentialsMissing.length||m.vacuum.state==='blocked'||m.mop.state==='blocked'||m.mop.state==='uncertain'||m.mop.state==='readiness_unknown'||(m.diagnostic.robot?.quality==='ambiguous-or-missing'&&(m.vacuum.state==='queued'||m.mop.state!=='disabled'&&m.mop.state!=='idle'));
     const topRight=indicatorMarkup('vacuum',m.vacuum)+indicatorMarkup('mop',m.mop)+(showFan?`<ha-icon class="active large" icon="mdi:fan" title="Extractor running"></ha-icon>`:'');
     const label=this._config.show_name === false?'':`<span class="label">${escapeText(m.profile.label)}</span>`;
     const temp=m.temperature===null?'—':`${escapeText(m.temperature)} °C`;
@@ -79,6 +109,8 @@ class RoomControlCard extends HTMLElement {
        ${this._more?`<section class="info"><h4>Connections &amp; cleaning status</h4><ul>
          <li>Vacuum: ${escapeText(m.vacuum.state)}</li><li>Mop: ${escapeText(m.mop.state)}</li>
          <li>Robot: ${escapeText(m.robotState??'not configured')}</li>
+         <li>Home Assistant Area: ${escapeText(m.area.name||m.area.id||'not matched')} (${escapeText(m.area.quality)}; ${escapeText(m.area.source)})</li>
+         ${this._registryError?`<li class="bad">Area registry lookup failed: ${escapeText(this._registryError)}</li>`:''}
          ${diagnostics.map(x=>`<li class="bad">${escapeText(x)}</li>`).join('')}
          ${m.mop.state==='blocked'?'<li class="bad">Mop hardware reports a confirmed blocker</li>':''}
          ${m.mop.state==='uncertain'?'<li class="bad">Mop active flag does not match confirmed robot activity</li>':''}
@@ -115,19 +147,20 @@ class RoomControlCard extends HTMLElement {
 }
 
 class RoomControlCardEditor extends HTMLElement {
-  constructor(){super();this.attachShadow({mode:'open'});this._registry=null;this._areas=null;this._requested=false;}
+  constructor(){super();this.attachShadow({mode:'open'});this._registries=null;this._registryLoad=null;this._registryError=null;}
   setConfig(config){this._config={...config,bindings:{...(config.bindings||{})}};this._render();}
   set hass(value){this._hass=value;this._loadRegistry();if(!this.shadowRoot.activeElement || this.shadowRoot.activeElement===this.shadowRoot.host)this._render();}
-  async _loadRegistry(){
-    if(this._requested||!this._hass?.callWS)return;
-    this._requested=true;
+  async _loadRegistry(force=false){
+    if((!force && (this._registries||this._registryLoad)) || !this._hass?.callWS)return;
+    const hass=this._hass;
+    this._registryLoad=fetchRegistries(hass,force);
     try{
-      const [entities,areas]=await Promise.all([
-        this._hass.callWS({type:'config/entity_registry/list'}),
-        this._hass.callWS({type:'config/area_registry/list'}),
-      ]);
-      this._registry=entities;this._areas=areas;this._render();
-    }catch(error){this._registry=[];this._areas=[];this._render();}
+      const result=await this._registryLoad;
+      if(this._hass?.connection!==hass.connection)return;
+      this._registries=result;this._registryError=null;
+    }catch(error){
+      this._registries=null;this._registryError=String(error?.message||error);
+    }finally{this._registryLoad=null;this._render();}
   }
   _save(patch){
     const updated={...this._config,...patch};
@@ -137,30 +170,35 @@ class RoomControlCardEditor extends HTMLElement {
   }
   _render(){
     if(!this._config||!this.shadowRoot)return;
-    const config=this._config, model=this._hass?buildModel(config,this._hass):null;
+    const config=this._config, model=this._hass?buildModel(config,this._hass,this._registries):null;
     const bindings=model?.bindings||proposedBindings(config.room,getPreset(config.room,config));
     const diagnostics=model?.diagnostic||{};
     const roomOptions=Object.keys(ROOM_PRESETS).map(x=>`<option value="${x}"></option>`).join('');
     const list=Object.keys(this._hass?.states||{}).sort();
     const idOptions=list.map(x=>`<option value="${escapeText(x)}"></option>`).join('');
-    const areaList=this._areas || [];
-    const areaOptions=areaList.map(a=>`<option value="${escapeText(a.area_id)}" ${config.area_id===a.area_id?'selected':''}>${escapeText(a.name)} (${escapeText(a.area_id)})</option>`).join('');
-    const entityRegistries=this._registry||[];
+    const areaList=this._registries?.areas || [];
+    const areaOptions=areaList.map(a=>`<option value="${escapeText(a.area_id)}" ${(config.area_id||model?.area?.id)===a.area_id?'selected':''}>${escapeText(a.name)} (${escapeText(a.area_id)})</option>`).join('');
+    const entityRegistries=this._registries?.entities||[];
     const row=(role)=>{
       const chosen=config.bindings?.[role]||'';
       const quality=diagnostics[role]?.quality||'not checked';
+      const origin=diagnostics[role]?.source||'unresolved';
+      const suggestions=diagnostics[role]?.candidates?.join(', ');
       const discovered=bindings[role]||'not discovered';
       return `<label>${escapeText(role.replaceAll('_',' '))}
         <input data-binding="${role}" list="room-control-entities" value="${escapeText(chosen)}" placeholder="${escapeText(discovered)}">
-        <small class="${quality==='ok'?'ok':quality==='missing'||quality==='wrong-domain'?'bad':''}">Suggested: ${escapeText(discovered)} · ${escapeText(quality)}</small>
+        <small class="${quality==='ok'?'ok':quality==='missing'||quality==='wrong-domain'?'bad':''}">Suggested: ${escapeText(discovered)} · ${escapeText(origin)} · ${escapeText(quality)}${suggestions?` · Choose: ${escapeText(suggestions)}`:''}</small>
       </label>`;
     };
     const fieldNames=['room_state','temperature','humidity',...(model?.profile.vacuum?['vacuum_queue','vacuum_active','vacuum_days']:[]),...(model?.profile.mop?['mop_queue','mop_active','mop_days']:[]),...(model?.profile.bedtime?['bedtime']:[]),...(model?.profile.fan?['fan']:[]),'robot','robot_status','robot_cleaning','water_shortage','mop_attached','water_box_attached','dock_error'];
-    const mismatches=entityRegistries.filter(e=>{
-      const id=Object.values(config.bindings||{}).includes(e.entity_id);
-      return id && e.area_id && config.area_id && e.area_id!==config.area_id;
-    }).map(x=>x.entity_id);
-    const unassigned=entityRegistries.filter(e=>Object.values(config.bindings||{}).includes(e.entity_id) && !e.area_id).map(x=>x.entity_id);
+    const climateRoles=['temperature','humidity'];
+    const selectedArea=model?.area?.id;
+    const mismatches=climateRoles.flatMap(role=>{
+      const entityId=config.bindings?.[role];
+      const entry=entityRegistries.find(e=>e.entity_id===entityId);
+      const assigned=effectiveEntityArea(entry,this._registries);
+      return (entityId&&selectedArea&&assigned&&assigned!==selectedArea)?[`${role}: ${entityId} (in ${assigned})`]:[];
+    });
     this.shadowRoot.innerHTML=`<style>
       :host{display:block;color:var(--primary-text-color)}.editor{display:grid;gap:12px;padding:10px}
       label{display:grid;gap:4px;font-size:13px;text-transform:capitalize}input,select{background:var(--card-background-color);color:inherit;border:1px solid var(--divider-color);border-radius:6px;padding:9px;min-width:0}
@@ -169,18 +207,23 @@ class RoomControlCardEditor extends HTMLElement {
       .warning{color:var(--warning-color,#ff9800);font-size:12px}
     </style><div class="editor">
       <label>Room key<input id="room" list="room-control-rooms" value="${escapeText(config.room)}"></label>
-      <label>Home Assistant area (optional, for connection auditing)<select id="area"><option value="">Not assigned</option>${areaOptions}</select></label>
+      <label>Home Assistant room (Area)<select id="area"><option value="">Auto-match from room name</option>${areaOptions}</select></label>
+      <small>Area sensors: preferred temperature/humidity → unique area-assigned device sensors → verified exact-name fallback. GPS Zones are not used.</small>
+      ${model?`<small>Area: ${escapeText(model.area.name||model.area.id||'not matched')} (${escapeText(model.area.quality)}; ${escapeText(model.area.source)})</small>`:''}
+      ${this._registryError?`<span class="warning">Registry unavailable: ${escapeText(this._registryError)}</span>`:''}
+      <button id="refresh" type="button">Refresh Area/Device/Entity registries</button>
       <datalist id="room-control-rooms">${roomOptions}</datalist><datalist id="room-control-entities">${idOptions}</datalist>
       <label>Navigation path (optional override)<input id="navigation" value="${escapeText(config.navigation_path||'')}" placeholder="${escapeText(model?.profile.path||'/lovelace/kitchen')}"></label>
       <label><span><input id="actions" type="checkbox" ${config.enable_actions===true?'checked':''}> Enable scripted hold/double-tap actions</span></label>
       <small>Actions are disabled by default. Cleaning actions require a confirmation. Robot queue and counters are never changed by this card.</small>
       <details><summary>Entity bindings &amp; diagnostics</summary><div class="editor">
         ${fieldNames.map(row).join('')}
-        ${mismatches.length?`<span class="warning">Explicitly mapped entities are assigned to a different area: ${escapeText(mismatches.join(', '))}</span>`:''}
-        ${config.area_id&&unassigned.length?`<span class="warning">No direct area assignment for: ${escapeText(unassigned.join(', '))}. This can be normal for device-inherited areas; check in Home Assistant.</span>`:''}
+        ${mismatches.length?`<span class="warning">Manually mapped climate entities belong to a different area: ${escapeText(mismatches.join(', '))}</span>`:''}
+
       </div></details>
       ${model?.missing?.length?`<span class="warning">${model.missing.length} missing, ambiguous or unavailable binding(s). Expand diagnostics for details.</span>`:''}
     </div>`;
+    this.shadowRoot.getElementById('refresh').addEventListener('click',()=>this._loadRegistry(true));
     this.shadowRoot.getElementById('room').addEventListener('change',e=>{this._save({room:e.target.value.trim(),bindings:{},area_id:undefined,profile:undefined,navigation_path:undefined,enable_actions:false});});
     this.shadowRoot.getElementById('area').addEventListener('change',e=>{this._save({area_id:e.target.value || undefined});});
     this.shadowRoot.getElementById('navigation').addEventListener('change',e=>{
@@ -201,4 +244,4 @@ window.customCards=window.customCards||[];
 if(!window.customCards.some(card=>card.type==='room-control-card'))window.customCards.push({
   type:'room-control-card',name:'Room Control Card',description:'Room navigation with verified device connections and vacuum/mop indicators',preview:true
 });
-console.info('%c ROOM CONTROL CARD %c v0.1.0','color:white;background:#44739e;font-weight:bold','color:#44739e');
+console.info('%c ROOM CONTROL CARD %c v0.2.0','color:white;background:#44739e;font-weight:bold','color:#44739e');

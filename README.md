@@ -119,9 +119,45 @@ profile:
   fan: false
 ```
 
-This first milestone provides built-in defaults and per-card overrides, **not yet a
+This pilot provides built-in defaults and per-card overrides, **not yet a
 shared room-profile database**. The next milestone is an optional companion HA
 integration for centrally storing profiles and exposing them to any card/dashboard.
+
+## Area-first mapping (v0.2.0 pilot)
+
+**Use Home Assistant Areas for rooms, not geolocation Zones.** Selecting `room: kitchen`
+now matches a uniquely named Home Assistant Kitchen Area automatically. The visual editor
+lets you select an explicit `area_id`, refresh registry information and inspect the source
+of every binding. Card and editor use read-only Area, Device and Entity registry lists.
+
+Temperature and humidity binding precedence: explicit card override → Home Assistant
+Area-preferred temperature/humidity entity → one unambiguous sensor in that Area (including
+device-inherited Areas) → exact traditional room entity name, provided it is not assigned to
+another Area. If an Area or sensor match is ambiguous, **no sensor is guessed**; the
+editor lists the candidates to choose manually.
+
+The Roborock is intentionally a **shared robot**, not a device tied to the Kitchen/Hall
+Area. Cassandra's mop queues, active flags and counters remain exact-name bindings and
+its notification and completion scripts are unchanged. Roborock map segment IDs are not
+derived from Areas. Hold/double-tap still require explicit `enable_actions: true`.
+
+<details><summary>Configuration examples</summary>
+
+```yaml
+type: custom:room-control-card
+room: kitchen
+bindings:
+  robot: vacuum.s8_maxv_ultra
+```
+
+For a nonstandard Home Assistant Area ID, add `area_id: your_actual_area_id`.
+For multiple climate sensors, set `bindings.temperature` or `bindings.humidity` to
+the appropriate entity from the editor. The existing corner indicators are preserved.
+
+</details>
+
+See [Area mapping and safety guide](docs/area-mapping.md) for the full decision rules,
+diagnostics, and how to test against Dashboard Test.
 
 ## Binding roles
 

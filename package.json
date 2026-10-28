@@ -1,13 +1,13 @@
 {
   "name": "ha-room-control-card",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Room controls with validated Home Assistant bindings and Cassandra-compatible cleaning indicators",
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "node --test tests/*.test.mjs",
-    "check": "npm run test && npm run build && node --check dist/ha-room-control-card.js"
+    "check": "npm run build && npm run test && node --check dist/ha-room-control-card.js"
   },
   "engines": {"node": ">=20"}
 }

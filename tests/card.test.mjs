@@ -74,5 +74,47 @@ test('config editor emits complete config when room changes',()=>{
  const {registry}=setup();const editor=new (registry.get('room-control-card-editor'))();
  editor.setConfig({room:'kitchen'});
  assert.ok(editor.shadowRoot.innerHTML.includes('Entity bindings'));
- assert.ok(editor.shadowRoot.innerHTML.includes('Home Assistant area'));
+ assert.ok(editor.shadowRoot.innerHTML.includes('Home Assistant room (Area)'));
+});
+
+
+test('card loads Area, Device and Entity registry to select a unique local temperature sensor',async()=>{
+ const {registry}=setup();const c=new (registry.get('room-control-card'))();
+ c.setConfig({room:'kitchen'});
+ const states=kitchen();states['sensor.area_t']={state:'18.5',attributes:{device_class:'temperature'}};
+ const calls=[];
+ const data={
+  'config/area_registry/list':[{area_id:'kitchen',name:'Kitchen',aliases:[]}],
+  'config/device_registry/list':[{id:'kdev',area_id:'kitchen'}],
+  'config/entity_registry/list':[{entity_id:'sensor.area_t',device_id:'kdev',area_id:null}]
+ };
+ c.hass={states,connection:{},callWS:async({type})=>{calls.push(type);return data[type];}};
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(c._model.temperature,'18.5');
+ assert.equal(c._model.diagnostic.temperature.source,'area-device');
+ assert.equal(c._model.bindings.mop_queue,'input_boolean.mop_que_kitchen');
+ assert.equal(calls.length,3);
+ c.hass={states,connection:c._hass.connection,callWS:async()=>{throw new Error('unexpected refetch');}};
+ assert.equal(calls.length,3);
+});
+
+test('editor shows exact ambiguous Area sensor candidates rather than picking one',async()=>{
+ const {registry}=setup();const editor=new (registry.get('room-control-card-editor'))();
+ editor.setConfig({room:'kitchen'});
+ const states=kitchen();
+ states['sensor.first']={state:'18',attributes:{device_class:'temperature'}};
+ states['sensor.second']={state:'19',attributes:{device_class:'temperature'}};
+ const data={
+  'config/area_registry/list':[{area_id:'kitchen',name:'Kitchen',aliases:[]}],
+  'config/device_registry/list':[],
+  'config/entity_registry/list':[
+   {entity_id:'sensor.first',area_id:'kitchen'},
+   {entity_id:'sensor.second',area_id:'kitchen'}
+  ]
+ };
+ editor.hass={states,connection:{},callWS:async({type})=>data[type]};
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.ok(editor.shadowRoot.innerHTML.includes('sensor.first, sensor.second'));
+ assert.ok(editor.shadowRoot.innerHTML.includes('ambiguous'));
+ assert.ok(editor.shadowRoot.innerHTML.includes('Refresh Area/Device/Entity registries'));
 });

@@ -17,6 +17,58 @@ export const BINDING_DOMAINS = Object.freeze({
   water_box_attached:'binary_sensor',dock_error:'sensor'
 });
 
+
+
+/** Registry metadata is read-only. A physical Area is not a GPS Zone or a robot map segment. */
+export function normaliseAreaName(value) {
+  return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g,'')
+    .toLowerCase().replace(/[^a-z0-9]/g,'');
+}
+
+export function findArea(room, areaId, registries) {
+  if(!registries || !Array.isArray(registries.areas)) {
+    return {id:areaId||null,quality:'pending',source:areaId?'explicit':'not-loaded',name:null};
+  }
+  const areas=registries.areas;
+  if(areaId) {
+    const matching=areas.find(a=>a.area_id===areaId);
+    return matching?{id:matching.area_id,name:matching.name,quality:'ok',source:'explicit',area:matching}:
+      {id:areaId,name:null,quality:'missing',source:'explicit'};
+  }
+  const key=normaliseAreaName(room);
+  const matching=areas.filter(a=>[a.area_id,a.name,...(a.aliases||[])]
+    .some(n=>normaliseAreaName(n)===key));
+  if(matching.length===1)return {id:matching[0].area_id,name:matching[0].name,quality:'ok',source:'matched',area:matching[0]};
+  if(matching.length>1)return {id:null,name:null,quality:'ambiguous',source:'matched',candidates:matching.map(a=>a.area_id)};
+  return {id:null,name:null,quality:'not-found',source:'matched'};
+}
+
+export function effectiveEntityArea(entry, registries) {
+  if(entry?.area_id) return entry.area_id;
+  if(!entry?.device_id) return null;
+  return (registries?.devices||[]).find(x=>x.id===entry.device_id)?.area_id||null;
+}
+
+/** Match preferred Area climate entities first, then a uniquely identified device_class sensor. */
+export function discoverClimate(room, config, hass, registries) {
+  const selected=findArea(room,config.area_id,registries);
+  const result={area:selected,roles:{}};
+  if(selected.quality!=='ok'||!Array.isArray(registries?.entities))return result;
+  const entities=registries.entities;
+  const states=hass?.states||{};
+  for(const role of ['temperature','humidity']) {
+    const preferred=selected.area?.[`${role}_entity_id`];
+    if(preferred) {result.roles[role]={id:preferred,source:'area-preferred'};continue;}
+    const matches=entities.filter(e=>e && !e.disabled_by && !e.hidden_by &&
+      e.entity_id?.startsWith('sensor.') && effectiveEntityArea(e,registries)===selected.id &&
+      (states[e.entity_id]?.attributes?.device_class===role));
+    // An unavailable but uniquely assigned sensor must remain unavailable, not be replaced.
+    if(matches.length===1)result.roles[role]={id:matches[0].entity_id,source:'area-device'};
+    else if(matches.length>1)result.roles[role]={id:null,source:'area-device',quality:'ambiguous',candidates:matches.map(e=>e.entity_id).sort()};
+  }
+  return result;
+}
+
 export const BAD_STATES = new Set(['unknown', 'unavailable', '', null, undefined]);
 const ALLOWED_ROOM = /^[a-z][a-z0-9_]{0,63}$/;
 const ALLOWED_ENTITY = /^[a-z_]+\.[a-z0-9_]+$/;
@@ -46,6 +98,9 @@ export function validateConfig(config) {
       throw new Error(`Room Control Card: invalid entity binding ${name}.`);
     }
   }
+  if(config.area_id !== undefined && (typeof config.area_id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(config.area_id))) {
+    throw new Error('Room Control Card: area_id must be a Home Assistant area ID.');
+  }
   const path=config.navigation_path || config.profile?.path;
   if (path && (!/^\/[a-zA-Z0-9/_-]+$/.test(path) || path.startsWith('//'))) {
     throw new Error('Room Control Card: navigation path must be a local dashboard path.');
@@ -74,13 +129,25 @@ export function proposedBindings(room, profile) {
   };
 }
 
-export function resolveBindings(config, hass) {
+export function resolveBindings(config, hass, registries = null) {
   validateConfig(config);
   const room=config.room, profile=getPreset(room,config);
   const states=hass?.states || {};
   const availableVacuumEntities=Object.keys(states).filter(id=>id.startsWith('vacuum.'));
   const automaticRobot=availableVacuumEntities.length===1 ? availableVacuumEntities[0] : null;
   const candidates=proposedBindings(room,profile);
+  const climate=discoverClimate(room,config,hass,registries);
+  const suggestedSource={};
+  const unresolvedArea=(config.area_id && climate.area.quality!=='ok') || climate.area.quality==='ambiguous';
+  if(unresolvedArea){
+    // An explicitly missing Area or ambiguous area name must not fall back to a potentially wrong room sensor.
+    delete candidates.temperature;delete candidates.humidity;
+  }
+  for(const role of ['temperature','humidity']) {
+    const entry=climate.roles[role];
+    if(entry?.id) {candidates[role]=entry.id;suggestedSource[role]=entry.source;}
+    else if(entry?.quality==='ambiguous') {delete candidates[role];suggestedSource[role]=entry.source;}
+  }
   if(automaticRobot) candidates.robot=automaticRobot;
   if(candidates.robot === 'vacuum.s8_maxv_ultra') {
     Object.assign(candidates,{
@@ -111,11 +178,31 @@ export function resolveBindings(config, hass) {
     const domain=id.split('.')[0];
     const entity=states[id];
     const quality=domain!==BINDING_DOMAINS[role]?'wrong-domain':!hass?'pending':!entity?'missing':BAD_STATES.has(entity.state)?'unavailable':'ok';
-    diagnostic[role]={entity_id:id,quality,explicit:Object.hasOwn(explicit,role)};
+    diagnostic[role]={entity_id:id,quality,explicit:Object.hasOwn(explicit,role),
+      source:Object.hasOwn(explicit,role)?'manual':(suggestedSource[role]||'convention')};
+  }
+  for(const role of ['temperature','humidity']){
+    if(unresolvedArea && !Object.hasOwn(explicit,role)){
+      diagnostic[role]={entity_id:null,quality:'area-unresolved',source:'area',explicit:false,
+        candidates:climate.area.candidates||[]};
+      continue;
+    }
+    const selection=climate.roles[role];
+    if(selection?.quality==='ambiguous' && !Object.hasOwn(explicit,role)){
+      diagnostic[role]={entity_id:null,quality:'ambiguous',source:'area-device',
+        explicit:false,candidates:selection.candidates};
+    }
+    // The exact-name fallback cannot silently borrow a sensor assigned to another Area.
+    const d=diagnostic[role],id=resolved[role];
+    if(d?.source==='convention' && climate.area.quality==='ok' && id && Array.isArray(registries?.entities)){
+      const entry=registries.entities.find(e=>e.entity_id===id);
+      const assigned=effectiveEntityArea(entry,registries);
+      if(assigned && assigned!==climate.area.id){d.quality='wrong-area';d.assigned_area=assigned;}
+    }
   }
   // No robot => show a warning in cleaning status rather than selecting arbitrarily.
   if((profile.vacuum||profile.mop) && !resolved.robot){diagnostic.robot={entity_id:null,quality:'ambiguous-or-missing',explicit:false};}
-  return {room,profile,bindings:resolved,diagnostic};
+  return {room,profile,bindings:resolved,diagnostic,area:climate.area};
 }
 
 function stateOf(states,bindings,role) { return bindings[role] ? states[bindings[role]]?.state : undefined; }
@@ -124,10 +211,10 @@ function numberOf(s) { if (!good(s)) return null; const n=Number(s); return Numb
 function binary(s) { return s==='on'?true:s==='off'?false:null; }
 
 /** Read-only display model. A queued task does not imply active or completed. */
-export function buildModel(config, hass) {
-  const {room,profile,bindings,diagnostic}=resolveBindings(config,hass);
+export function buildModel(config, hass, registries = null) {
+  const {room,profile,bindings,diagnostic,area}=resolveBindings(config,hass,registries);
   const states=hass?.states || {};
-  const val=(role)=>stateOf(states,bindings,role);
+  const val=(role)=>diagnostic[role]?.quality==='wrong-area'?undefined:stateOf(states,bindings,role);
   const robotStatus=val('robot_status');
   const robotState=val('robot');
   const confirmedCleaning = binary(val('robot_cleaning'))===true ||
@@ -164,7 +251,7 @@ export function buildModel(config, hass) {
   const rawTemp=good(tempState)&&Number.isFinite(Number(tempState)) ? Number(tempState) : null;
   const rawHumidity=numberOf(val('humidity'));
   return {
-    room, profile, bindings, diagnostic, missing,
+    room, profile, bindings, diagnostic, missing, area,
     roomOn:binary(val('room_state')), bedtime:binary(val('bedtime')),
     fan:binary(val('fan')),vacuum,mop,
     temperature:rawTemp===null?null:rawTemp.toFixed(1),
