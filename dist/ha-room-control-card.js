@@ -1,4 +1,4 @@
-/* Room Control Card v0.1.0 — build from src; no external dependencies. */
+/* Room Control Card v0.2.0 — build from src; no external dependencies. */
 (()=>{
 'use strict';
 /** Pure room-state, binding and action evaluation. No DOM or Home Assistant side effects. */
@@ -19,6 +19,58 @@ const BINDING_DOMAINS = Object.freeze({
   robot_cleaning:'binary_sensor',water_shortage:'binary_sensor',mop_attached:'binary_sensor',
   water_box_attached:'binary_sensor',dock_error:'sensor'
 });
+
+
+
+/** Registry metadata is read-only. A physical Area is not a GPS Zone or a robot map segment. */
+function normaliseAreaName(value) {
+  return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g,'')
+    .toLowerCase().replace(/[^a-z0-9]/g,'');
+}
+
+function findArea(room, areaId, registries) {
+  if(!registries || !Array.isArray(registries.areas)) {
+    return {id:areaId||null,quality:'pending',source:areaId?'explicit':'not-loaded',name:null};
+  }
+  const areas=registries.areas;
+  if(areaId) {
+    const matching=areas.find(a=>a.area_id===areaId);
+    return matching?{id:matching.area_id,name:matching.name,quality:'ok',source:'explicit',area:matching}:
+      {id:areaId,name:null,quality:'missing',source:'explicit'};
+  }
+  const key=normaliseAreaName(room);
+  const matching=areas.filter(a=>[a.area_id,a.name,...(a.aliases||[])]
+    .some(n=>normaliseAreaName(n)===key));
+  if(matching.length===1)return {id:matching[0].area_id,name:matching[0].name,quality:'ok',source:'matched',area:matching[0]};
+  if(matching.length>1)return {id:null,name:null,quality:'ambiguous',source:'matched',candidates:matching.map(a=>a.area_id)};
+  return {id:null,name:null,quality:'not-found',source:'matched'};
+}
+
+function effectiveEntityArea(entry, registries) {
+  if(entry?.area_id) return entry.area_id;
+  if(!entry?.device_id) return null;
+  return (registries?.devices||[]).find(x=>x.id===entry.device_id)?.area_id||null;
+}
+
+/** Match preferred Area climate entities first, then a uniquely identified device_class sensor. */
+function discoverClimate(room, config, hass, registries) {
+  const selected=findArea(room,config.area_id,registries);
+  const result={area:selected,roles:{}};
+  if(selected.quality!=='ok'||!Array.isArray(registries?.entities))return result;
+  const entities=registries.entities;
+  const states=hass?.states||{};
+  for(const role of ['temperature','humidity']) {
+    const preferred=selected.area?.[`${role}_entity_id`];
+    if(preferred) {result.roles[role]={id:preferred,source:'area-preferred'};continue;}
+    const matches=entities.filter(e=>e && !e.disabled_by && !e.hidden_by &&
+      e.entity_id?.startsWith('sensor.') && effectiveEntityArea(e,registries)===selected.id &&
+      (states[e.entity_id]?.attributes?.device_class===role));
+    // An unavailable but uniquely assigned sensor must remain unavailable, not be replaced.
+    if(matches.length===1)result.roles[role]={id:matches[0].entity_id,source:'area-device'};
+    else if(matches.length>1)result.roles[role]={id:null,source:'area-device',quality:'ambiguous',candidates:matches.map(e=>e.entity_id).sort()};
+  }
+  return result;
+}
 
 const BAD_STATES = new Set(['unknown', 'unavailable', '', null, undefined]);
 const ALLOWED_ROOM = /^[a-z][a-z0-9_]{0,63}$/;
@@ -49,6 +101,9 @@ function validateConfig(config) {
       throw new Error(`Room Control Card: invalid entity binding ${name}.`);
     }
   }
+  if(config.area_id !== undefined && (typeof config.area_id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(config.area_id))) {
+    throw new Error('Room Control Card: area_id must be a Home Assistant area ID.');
+  }
   const path=config.navigation_path || config.profile?.path;
   if (path && (!/^\/[a-zA-Z0-9/_-]+$/.test(path) || path.startsWith('//'))) {
     throw new Error('Room Control Card: navigation path must be a local dashboard path.');
@@ -77,13 +132,25 @@ function proposedBindings(room, profile) {
   };
 }
 
-function resolveBindings(config, hass) {
+function resolveBindings(config, hass, registries = null) {
   validateConfig(config);
   const room=config.room, profile=getPreset(room,config);
   const states=hass?.states || {};
   const availableVacuumEntities=Object.keys(states).filter(id=>id.startsWith('vacuum.'));
   const automaticRobot=availableVacuumEntities.length===1 ? availableVacuumEntities[0] : null;
   const candidates=proposedBindings(room,profile);
+  const climate=discoverClimate(room,config,hass,registries);
+  const suggestedSource={};
+  const unresolvedArea=(config.area_id && climate.area.quality!=='ok') || climate.area.quality==='ambiguous';
+  if(unresolvedArea){
+    // An explicitly missing Area or ambiguous area name must not fall back to a potentially wrong room sensor.
+    delete candidates.temperature;delete candidates.humidity;
+  }
+  for(const role of ['temperature','humidity']) {
+    const entry=climate.roles[role];
+    if(entry?.id) {candidates[role]=entry.id;suggestedSource[role]=entry.source;}
+    else if(entry?.quality==='ambiguous') {delete candidates[role];suggestedSource[role]=entry.source;}
+  }
   if(automaticRobot) candidates.robot=automaticRobot;
   if(candidates.robot === 'vacuum.s8_maxv_ultra') {
     Object.assign(candidates,{
@@ -114,11 +181,31 @@ function resolveBindings(config, hass) {
     const domain=id.split('.')[0];
     const entity=states[id];
     const quality=domain!==BINDING_DOMAINS[role]?'wrong-domain':!hass?'pending':!entity?'missing':BAD_STATES.has(entity.state)?'unavailable':'ok';
-    diagnostic[role]={entity_id:id,quality,explicit:Object.hasOwn(explicit,role)};
+    diagnostic[role]={entity_id:id,quality,explicit:Object.hasOwn(explicit,role),
+      source:Object.hasOwn(explicit,role)?'manual':(suggestedSource[role]||'convention')};
+  }
+  for(const role of ['temperature','humidity']){
+    if(unresolvedArea && !Object.hasOwn(explicit,role)){
+      diagnostic[role]={entity_id:null,quality:'area-unresolved',source:'area',explicit:false,
+        candidates:climate.area.candidates||[]};
+      continue;
+    }
+    const selection=climate.roles[role];
+    if(selection?.quality==='ambiguous' && !Object.hasOwn(explicit,role)){
+      diagnostic[role]={entity_id:null,quality:'ambiguous',source:'area-device',
+        explicit:false,candidates:selection.candidates};
+    }
+    // The exact-name fallback cannot silently borrow a sensor assigned to another Area.
+    const d=diagnostic[role],id=resolved[role];
+    if(d?.source==='convention' && climate.area.quality==='ok' && id && Array.isArray(registries?.entities)){
+      const entry=registries.entities.find(e=>e.entity_id===id);
+      const assigned=effectiveEntityArea(entry,registries);
+      if(assigned && assigned!==climate.area.id){d.quality='wrong-area';d.assigned_area=assigned;}
+    }
   }
   // No robot => show a warning in cleaning status rather than selecting arbitrarily.
   if((profile.vacuum||profile.mop) && !resolved.robot){diagnostic.robot={entity_id:null,quality:'ambiguous-or-missing',explicit:false};}
-  return {room,profile,bindings:resolved,diagnostic};
+  return {room,profile,bindings:resolved,diagnostic,area:climate.area};
 }
 
 function stateOf(states,bindings,role) { return bindings[role] ? states[bindings[role]]?.state : undefined; }
@@ -127,10 +214,10 @@ function numberOf(s) { if (!good(s)) return null; const n=Number(s); return Numb
 function binary(s) { return s==='on'?true:s==='off'?false:null; }
 
 /** Read-only display model. A queued task does not imply active or completed. */
-function buildModel(config, hass) {
-  const {room,profile,bindings,diagnostic}=resolveBindings(config,hass);
+function buildModel(config, hass, registries = null) {
+  const {room,profile,bindings,diagnostic,area}=resolveBindings(config,hass,registries);
   const states=hass?.states || {};
-  const val=(role)=>stateOf(states,bindings,role);
+  const val=(role)=>diagnostic[role]?.quality==='wrong-area'?undefined:stateOf(states,bindings,role);
   const robotStatus=val('robot_status');
   const robotState=val('robot');
   const confirmedCleaning = binary(val('robot_cleaning'))===true ||
@@ -167,7 +254,7 @@ function buildModel(config, hass) {
   const rawTemp=good(tempState)&&Number.isFinite(Number(tempState)) ? Number(tempState) : null;
   const rawHumidity=numberOf(val('humidity'));
   return {
-    room, profile, bindings, diagnostic, missing,
+    room, profile, bindings, diagnostic, missing, area,
     roomOn:binary(val('room_state')), bedtime:binary(val('bedtime')),
     fan:binary(val('fan')),vacuum,mop,
     temperature:rawTemp===null?null:rawTemp.toFixed(1),
@@ -214,6 +301,24 @@ function resolveAction(config, model, gesture, hass) {
 const escapeText = (value) => String(value ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const safeIcon = (value) => /^[a-z][a-z0-9_-]*:[a-z0-9_-]+$/.test(value||'') ? value : 'mdi:home-outline';
 
+// Shared registry fetches are read-only; never write Home Assistant's Area/Device/Entity registry.
+const REGISTRY_CACHE = new WeakMap();
+function fetchRegistries(hass, force=false) {
+  if (!hass?.callWS) return Promise.resolve(null);
+  const key=hass.connection && typeof hass.connection==='object' ? hass.connection : hass;
+  if (force) REGISTRY_CACHE.delete(key);
+  if (!REGISTRY_CACHE.has(key)) {
+    const request=Promise.all([
+      hass.callWS({type:'config/area_registry/list'}),
+      hass.callWS({type:'config/device_registry/list'}),
+      hass.callWS({type:'config/entity_registry/list'})
+    ]).then(([areas,devices,entities])=>({areas,devices,entities}))
+      .catch(error=>{REGISTRY_CACHE.delete(key);throw error;});
+    REGISTRY_CACHE.set(key,request);
+  }
+  return REGISTRY_CACHE.get(key);
+}
+
 const BASE_CSS = `
 :host { display:block; color:var(--primary-text-color); }
 ha-card { position:relative; background:var(--ha-card-background,var(--card-background-color)); border-radius:var(--ha-card-border-radius,16px); overflow:hidden; border:1px solid var(--divider-color); }
@@ -255,25 +360,37 @@ function indicatorMarkup(kind, status) {
 }
 
 class RoomControlCard extends HTMLElement {
-  constructor(){super();this.attachShadow({mode:'open'});this._more=false;this._touchLong=false;this._tapTimer=null;this._holdTimer=null;}
+  constructor(){super();this.attachShadow({mode:'open'});this._more=false;this._touchLong=false;this._tapTimer=null;this._holdTimer=null;this._registryPromise=null;this._registries=null;this._registryError=null;}
   static getStubConfig(){return {room:'kitchen'};}
   static getConfigElement(){return document.createElement('room-control-card-editor');}
   getCardSize(){return 3;}
   getGridOptions(){return {columns:6,min_columns:3,rows:3,min_rows:2};}
   setConfig(config){validateConfig(config);this._config={...config};this._render();}
-  set hass(value){this._hass=value;if(this._config)this._render();}
+  set hass(value){this._hass=value;this._loadRegistry();if(this._config)this._render();}
+  async _loadRegistry(){
+    if(this._registries || this._registryPromise || !this._hass?.callWS)return;
+    const hass=this._hass;
+    this._registryPromise=fetchRegistries(hass);
+    try{
+      const data=await this._registryPromise;
+      if(this._hass?.connection !== hass.connection)return;
+      this._registries=data;this._registryError=null;
+    }catch(error){
+      this._registryError=String(error?.message||error);
+    }finally{this._registryPromise=null;if(this._config)this._render();}
+  }
   _render(){
     if(!this.shadowRoot||!this._config)return;
     let model;
-    try {model=buildModel(this._config,this._hass);}catch(e){this.shadowRoot.innerHTML=`<style>${BASE_CSS}</style><ha-card><div class="info bad">${escapeText(e.message)}</div></ha-card>`;return;}
+    try {model=buildModel(this._config,this._hass,this._registries);}catch(e){this.shadowRoot.innerHTML=`<style>${BASE_CSS}</style><ha-card><div class="info bad">${escapeText(e.message)}</div></ha-card>`;return;}
     this._model=model;
     const m=model,roomColor=m.roomOn===true?'var(--primary-color,#ffd60a)':'#44739e';
     const showNight=m.profile.bedtime&&m.bedtime===true;
     const showFan=m.profile.fan&&m.fan===true;
-    const diagnostics=m.missing.map(x=>`${x.role}: ${x.quality} (${x.entity_id||'not configured'})`);
+    const diagnostics=m.missing.map(x=>`${x.role}: ${x.quality} (${x.entity_id||'not configured'})${x.candidates?.length?' — choose '+x.candidates.join(' or '):''}`);
     const essentials=['room_state','temperature','humidity',...(m.profile.vacuum?['vacuum_queue','vacuum_active']:[]),...(m.profile.mop?['mop_queue','mop_active']:[])];
     const essentialsMissing=essentials.filter(x=>m.diagnostic[x] && m.diagnostic[x].quality!=='ok' && m.diagnostic[x].quality!=='pending');
-    const health=essentialsMissing.length||m.vacuum.state==='blocked'||m.mop.state==='blocked'||m.mop.state==='uncertain'||m.mop.state==='readiness_unknown'||(m.diagnostic.robot?.quality==='ambiguous-or-missing'&&(m.vacuum.state==='queued'||m.mop.state!=='disabled'&&m.mop.state!=='idle'));
+    const health=(this._config.area_id && m.area.quality==='missing')||m.area.quality==='ambiguous'||essentialsMissing.length||m.vacuum.state==='blocked'||m.mop.state==='blocked'||m.mop.state==='uncertain'||m.mop.state==='readiness_unknown'||(m.diagnostic.robot?.quality==='ambiguous-or-missing'&&(m.vacuum.state==='queued'||m.mop.state!=='disabled'&&m.mop.state!=='idle'));
     const topRight=indicatorMarkup('vacuum',m.vacuum)+indicatorMarkup('mop',m.mop)+(showFan?`<ha-icon class="active large" icon="mdi:fan" title="Extractor running"></ha-icon>`:'');
     const label=this._config.show_name === false?'':`<span class="label">${escapeText(m.profile.label)}</span>`;
     const temp=m.temperature===null?'—':`${escapeText(m.temperature)} °C`;
@@ -291,6 +408,8 @@ class RoomControlCard extends HTMLElement {
        ${this._more?`<section class="info"><h4>Connections &amp; cleaning status</h4><ul>
          <li>Vacuum: ${escapeText(m.vacuum.state)}</li><li>Mop: ${escapeText(m.mop.state)}</li>
          <li>Robot: ${escapeText(m.robotState??'not configured')}</li>
+         <li>Home Assistant Area: ${escapeText(m.area.name||m.area.id||'not matched')} (${escapeText(m.area.quality)}; ${escapeText(m.area.source)})</li>
+         ${this._registryError?`<li class="bad">Area registry lookup failed: ${escapeText(this._registryError)}</li>`:''}
          ${diagnostics.map(x=>`<li class="bad">${escapeText(x)}</li>`).join('')}
          ${m.mop.state==='blocked'?'<li class="bad">Mop hardware reports a confirmed blocker</li>':''}
          ${m.mop.state==='uncertain'?'<li class="bad">Mop active flag does not match confirmed robot activity</li>':''}
@@ -327,19 +446,20 @@ class RoomControlCard extends HTMLElement {
 }
 
 class RoomControlCardEditor extends HTMLElement {
-  constructor(){super();this.attachShadow({mode:'open'});this._registry=null;this._areas=null;this._requested=false;}
+  constructor(){super();this.attachShadow({mode:'open'});this._registries=null;this._registryLoad=null;this._registryError=null;}
   setConfig(config){this._config={...config,bindings:{...(config.bindings||{})}};this._render();}
   set hass(value){this._hass=value;this._loadRegistry();if(!this.shadowRoot.activeElement || this.shadowRoot.activeElement===this.shadowRoot.host)this._render();}
-  async _loadRegistry(){
-    if(this._requested||!this._hass?.callWS)return;
-    this._requested=true;
+  async _loadRegistry(force=false){
+    if((!force && (this._registries||this._registryLoad)) || !this._hass?.callWS)return;
+    const hass=this._hass;
+    this._registryLoad=fetchRegistries(hass,force);
     try{
-      const [entities,areas]=await Promise.all([
-        this._hass.callWS({type:'config/entity_registry/list'}),
-        this._hass.callWS({type:'config/area_registry/list'}),
-      ]);
-      this._registry=entities;this._areas=areas;this._render();
-    }catch(error){this._registry=[];this._areas=[];this._render();}
+      const result=await this._registryLoad;
+      if(this._hass?.connection!==hass.connection)return;
+      this._registries=result;this._registryError=null;
+    }catch(error){
+      this._registries=null;this._registryError=String(error?.message||error);
+    }finally{this._registryLoad=null;this._render();}
   }
   _save(patch){
     const updated={...this._config,...patch};
@@ -349,30 +469,35 @@ class RoomControlCardEditor extends HTMLElement {
   }
   _render(){
     if(!this._config||!this.shadowRoot)return;
-    const config=this._config, model=this._hass?buildModel(config,this._hass):null;
+    const config=this._config, model=this._hass?buildModel(config,this._hass,this._registries):null;
     const bindings=model?.bindings||proposedBindings(config.room,getPreset(config.room,config));
     const diagnostics=model?.diagnostic||{};
     const roomOptions=Object.keys(ROOM_PRESETS).map(x=>`<option value="${x}"></option>`).join('');
     const list=Object.keys(this._hass?.states||{}).sort();
     const idOptions=list.map(x=>`<option value="${escapeText(x)}"></option>`).join('');
-    const areaList=this._areas || [];
-    const areaOptions=areaList.map(a=>`<option value="${escapeText(a.area_id)}" ${config.area_id===a.area_id?'selected':''}>${escapeText(a.name)} (${escapeText(a.area_id)})</option>`).join('');
-    const entityRegistries=this._registry||[];
+    const areaList=this._registries?.areas || [];
+    const areaOptions=areaList.map(a=>`<option value="${escapeText(a.area_id)}" ${(config.area_id||model?.area?.id)===a.area_id?'selected':''}>${escapeText(a.name)} (${escapeText(a.area_id)})</option>`).join('');
+    const entityRegistries=this._registries?.entities||[];
     const row=(role)=>{
       const chosen=config.bindings?.[role]||'';
       const quality=diagnostics[role]?.quality||'not checked';
+      const origin=diagnostics[role]?.source||'unresolved';
+      const suggestions=diagnostics[role]?.candidates?.join(', ');
       const discovered=bindings[role]||'not discovered';
       return `<label>${escapeText(role.replaceAll('_',' '))}
         <input data-binding="${role}" list="room-control-entities" value="${escapeText(chosen)}" placeholder="${escapeText(discovered)}">
-        <small class="${quality==='ok'?'ok':quality==='missing'||quality==='wrong-domain'?'bad':''}">Suggested: ${escapeText(discovered)} · ${escapeText(quality)}</small>
+        <small class="${quality==='ok'?'ok':quality==='missing'||quality==='wrong-domain'?'bad':''}">Suggested: ${escapeText(discovered)} · ${escapeText(origin)} · ${escapeText(quality)}${suggestions?` · Choose: ${escapeText(suggestions)}`:''}</small>
       </label>`;
     };
     const fieldNames=['room_state','temperature','humidity',...(model?.profile.vacuum?['vacuum_queue','vacuum_active','vacuum_days']:[]),...(model?.profile.mop?['mop_queue','mop_active','mop_days']:[]),...(model?.profile.bedtime?['bedtime']:[]),...(model?.profile.fan?['fan']:[]),'robot','robot_status','robot_cleaning','water_shortage','mop_attached','water_box_attached','dock_error'];
-    const mismatches=entityRegistries.filter(e=>{
-      const id=Object.values(config.bindings||{}).includes(e.entity_id);
-      return id && e.area_id && config.area_id && e.area_id!==config.area_id;
-    }).map(x=>x.entity_id);
-    const unassigned=entityRegistries.filter(e=>Object.values(config.bindings||{}).includes(e.entity_id) && !e.area_id).map(x=>x.entity_id);
+    const climateRoles=['temperature','humidity'];
+    const selectedArea=model?.area?.id;
+    const mismatches=climateRoles.flatMap(role=>{
+      const entityId=config.bindings?.[role];
+      const entry=entityRegistries.find(e=>e.entity_id===entityId);
+      const assigned=effectiveEntityArea(entry,this._registries);
+      return (entityId&&selectedArea&&assigned&&assigned!==selectedArea)?[`${role}: ${entityId} (in ${assigned})`]:[];
+    });
     this.shadowRoot.innerHTML=`<style>
       :host{display:block;color:var(--primary-text-color)}.editor{display:grid;gap:12px;padding:10px}
       label{display:grid;gap:4px;font-size:13px;text-transform:capitalize}input,select{background:var(--card-background-color);color:inherit;border:1px solid var(--divider-color);border-radius:6px;padding:9px;min-width:0}
@@ -381,18 +506,23 @@ class RoomControlCardEditor extends HTMLElement {
       .warning{color:var(--warning-color,#ff9800);font-size:12px}
     </style><div class="editor">
       <label>Room key<input id="room" list="room-control-rooms" value="${escapeText(config.room)}"></label>
-      <label>Home Assistant area (optional, for connection auditing)<select id="area"><option value="">Not assigned</option>${areaOptions}</select></label>
+      <label>Home Assistant room (Area)<select id="area"><option value="">Auto-match from room name</option>${areaOptions}</select></label>
+      <small>Area sensors: preferred temperature/humidity → unique area-assigned device sensors → verified exact-name fallback. GPS Zones are not used.</small>
+      ${model?`<small>Area: ${escapeText(model.area.name||model.area.id||'not matched')} (${escapeText(model.area.quality)}; ${escapeText(model.area.source)})</small>`:''}
+      ${this._registryError?`<span class="warning">Registry unavailable: ${escapeText(this._registryError)}</span>`:''}
+      <button id="refresh" type="button">Refresh Area/Device/Entity registries</button>
       <datalist id="room-control-rooms">${roomOptions}</datalist><datalist id="room-control-entities">${idOptions}</datalist>
       <label>Navigation path (optional override)<input id="navigation" value="${escapeText(config.navigation_path||'')}" placeholder="${escapeText(model?.profile.path||'/lovelace/kitchen')}"></label>
       <label><span><input id="actions" type="checkbox" ${config.enable_actions===true?'checked':''}> Enable scripted hold/double-tap actions</span></label>
       <small>Actions are disabled by default. Cleaning actions require a confirmation. Robot queue and counters are never changed by this card.</small>
       <details><summary>Entity bindings &amp; diagnostics</summary><div class="editor">
         ${fieldNames.map(row).join('')}
-        ${mismatches.length?`<span class="warning">Explicitly mapped entities are assigned to a different area: ${escapeText(mismatches.join(', '))}</span>`:''}
-        ${config.area_id&&unassigned.length?`<span class="warning">No direct area assignment for: ${escapeText(unassigned.join(', '))}. This can be normal for device-inherited areas; check in Home Assistant.</span>`:''}
+        ${mismatches.length?`<span class="warning">Manually mapped climate entities belong to a different area: ${escapeText(mismatches.join(', '))}</span>`:''}
+
       </div></details>
       ${model?.missing?.length?`<span class="warning">${model.missing.length} missing, ambiguous or unavailable binding(s). Expand diagnostics for details.</span>`:''}
     </div>`;
+    this.shadowRoot.getElementById('refresh').addEventListener('click',()=>this._loadRegistry(true));
     this.shadowRoot.getElementById('room').addEventListener('change',e=>{this._save({room:e.target.value.trim(),bindings:{},area_id:undefined,profile:undefined,navigation_path:undefined,enable_actions:false});});
     this.shadowRoot.getElementById('area').addEventListener('change',e=>{this._save({area_id:e.target.value || undefined});});
     this.shadowRoot.getElementById('navigation').addEventListener('change',e=>{
@@ -413,6 +543,6 @@ window.customCards=window.customCards||[];
 if(!window.customCards.some(card=>card.type==='room-control-card'))window.customCards.push({
   type:'room-control-card',name:'Room Control Card',description:'Room navigation with verified device connections and vacuum/mop indicators',preview:true
 });
-console.info('%c ROOM CONTROL CARD %c v0.1.0','color:white;background:#44739e;font-weight:bold','color:#44739e');
+console.info('%c ROOM CONTROL CARD %c v0.2.0','color:white;background:#44739e;font-weight:bold','color:#44739e');
 
 })();

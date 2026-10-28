@@ -1,10 +1,10 @@
-# Add in the Home Assistant dashboard card editor after the JS resource is loaded.
-# This is the safe, READ-ONLY pilot: tap navigation is enabled; scripted actions are not.
+# Add in Dashboard Test. Navigation only; physical actions remain disabled.
 type: custom:room-control-card
 room: kitchen
 bindings:
   robot: vacuum.s8_maxv_ultra
 
-# To display other rooms, use room: hall, office, bathroom, bedroom or livingroom.
-# For mop notifications, the card reads queue and active flags managed by Cassandra.
-# Existing Home Assistant scripts remain responsible for progress/completion notifications.
+# The card now matches the Home Assistant Kitchen Area automatically when unique.
+# Alternatively use area_id: <actual-area-id> in the editor to select another Area.
+# Area preferences and uniquely assigned temperature/humidity sensors take priority.
+# Mopping and vacuum indicators continue to use Cassandra's room-specific helpers.

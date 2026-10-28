@@ -166,3 +166,129 @@ test('malformed room and nonlocal paths are rejected',()=>{
   assert.throws(()=>validateConfig({room:'kitchen',bindings:{robot:'vacuum.good; bad'}}));
   assert.throws(()=>validateConfig({room:'kitchen',bindings:{not_a_role:'sensor.x'}}));
 });
+
+function areaRegistries({preferred=false, duplicated=false, area='kitchen'}={}) {
+  return {
+    areas:[{area_id:area,name:area==='living_room'?'Living Room':'Kitchen',aliases:[],
+      temperature_entity_id:preferred?'sensor.preferred_temperature':null,
+      humidity_entity_id:preferred?'sensor.preferred_humidity':null}],
+    devices:[{id:'device_kitchen',area_id:area},{id:'device_hall',area_id:'hall'}],
+    entities:[
+      {entity_id:'sensor.area_temperature',device_id:'device_kitchen',area_id:null},
+      {entity_id:'sensor.area_humidity',device_id:'device_kitchen',area_id:null},
+      {entity_id:'sensor.hall_temperature',device_id:'device_hall',area_id:null},
+      ...(duplicated?[{entity_id:'sensor.second_temperature',device_id:'device_kitchen',area_id:null}]:[]),
+    ]
+  };
+}
+function areaStates(){
+  const states=makeStates();
+  states['sensor.area_temperature']={state:'19.3',attributes:{device_class:'temperature'}};
+  states['sensor.area_humidity']={state:'43.9',attributes:{device_class:'humidity'}};
+  states['sensor.hall_temperature']={state:'15',attributes:{device_class:'temperature'}};
+  states['sensor.second_temperature']={state:'20',attributes:{device_class:'temperature'}};
+  states['sensor.preferred_temperature']={state:'23',attributes:{device_class:'temperature'}};
+  states['sensor.preferred_humidity']={state:'55',attributes:{device_class:'humidity'}};
+  return states;
+}
+
+test('area name matching supports spaces and aliases, but not GPS Zones',async()=>{
+  const {findArea}=await import('../src/model.mjs');
+  const reg=areaRegistries({area:'living_room'});
+  assert.equal(findArea('livingroom',undefined,reg).id,'living_room');
+  reg.areas[0].aliases=['Drawing Room'];
+  assert.equal(findArea('drawing_room',undefined,reg).id,'living_room');
+  reg.areas.push({area_id:'other',name:'Drawing room',aliases:[]});
+  assert.equal(findArea('drawingroom',undefined,reg).quality,'ambiguous');
+  assert.equal(findArea('kitchen','not_registered',reg).quality,'missing');
+});
+
+test('area preferred climate sensors win over device and conventional names',()=>{
+  const reg=areaRegistries({preferred:true});
+  const model=buildModel({room:'kitchen'},hass(areaStates()),reg);
+  assert.equal(model.area.id,'kitchen');
+  assert.equal(model.temperature,'23.0');
+  assert.equal(model.humidity,'55.0');
+  assert.equal(model.diagnostic.temperature.source,'area-preferred');
+  assert.equal(model.bindings.vacuum_queue,'input_boolean.vacuum_que_kitchen');
+  assert.equal(model.bindings.mop_active,'input_boolean.mopping_kitchen');
+});
+
+test('unique device-inherited area sensors are discovered without fuzzy name matching',()=>{
+  const reg=areaRegistries();
+  const model=buildModel({room:'kitchen'},hass(areaStates()),reg);
+  assert.equal(model.temperature,'19.3');
+  assert.equal(model.humidity,'43.9');
+  assert.equal(model.diagnostic.temperature.source,'area-device');
+});
+
+test('two plausible temperature sensors in the same area fail closed',()=>{
+  const reg=areaRegistries({duplicated:true});
+  const model=buildModel({room:'kitchen'},hass(areaStates()),reg);
+  assert.equal(model.temperature,null);
+  assert.equal(model.diagnostic.temperature.quality,'ambiguous');
+  assert.deepEqual(model.diagnostic.temperature.candidates,['sensor.area_temperature','sensor.second_temperature']);
+  assert.equal(model.humidity,'43.9');
+  assert.equal(model.mop.state,'queued');
+});
+
+test('manual climate choice can resolve ambiguity without changing the robot',()=>{
+  const reg=areaRegistries({duplicated:true});
+  const config={room:'kitchen',bindings:{temperature:'sensor.second_temperature',robot:'vacuum.s8_maxv_ultra'}};
+  const model=buildModel(config,hass(areaStates()),reg);
+  assert.equal(model.temperature,'20.0');
+  assert.equal(model.diagnostic.temperature.source,'manual');
+  assert.equal(model.bindings.robot,'vacuum.s8_maxv_ultra');
+});
+
+test('name-matched conventional sensor in a different registered area is rejected',()=>{
+  const reg=areaRegistries();
+  reg.entities=reg.entities.filter(e=>e.entity_id!=='sensor.area_temperature');
+  reg.entities.push({entity_id:'sensor.kitchen_multi_sensor_temperature',area_id:'hall'});
+  const model=buildModel({room:'kitchen'},hass(areaStates()),reg);
+  assert.equal(model.temperature,null);
+  assert.equal(model.diagnostic.temperature.quality,'wrong-area');
+  assert.equal(model.diagnostic.temperature.assigned_area,'hall');
+});
+
+test('an unavailable area-preferred sensor stays unavailable rather than switching to an unrelated sensor',()=>{
+  const reg=areaRegistries({preferred:true});
+  const states=areaStates();states['sensor.preferred_temperature'].state='unavailable';
+  const model=buildModel({room:'kitchen'},hass(states),reg);
+  assert.equal(model.temperature,null);
+  assert.equal(model.diagnostic.temperature.quality,'unavailable');
+});
+
+test('missing area registry data retains exact-name backwards compatibility',()=>{
+  const model=buildModel({room:'kitchen'},hass(makeStates()));
+  assert.equal(model.temperature,'21.2');
+  assert.equal(model.diagnostic.temperature.source,'convention');
+  assert.equal(model.area.quality,'pending');
+});
+
+test('read-only area matching never assigns robot by area or sends commands',()=>{
+  const reg=areaRegistries();
+  const states=areaStates();states['vacuum.second']={state:'docked'};
+  const model=buildModel({room:'kitchen'},hass(states),reg);
+  assert.equal(model.diagnostic.robot.quality,'ambiguous-or-missing');
+  assert.equal(model.bindings.robot,undefined);
+});
+
+
+test('explicit missing Area fails closed instead of silently showing conventional climate',()=>{
+  const reg=areaRegistries();
+  const model=buildModel({room:'kitchen',area_id:'missing'},hass(areaStates()),reg);
+  assert.equal(model.temperature,null);
+  assert.equal(model.humidity,null);
+  assert.equal(model.diagnostic.temperature.quality,'area-unresolved');
+  assert.equal(model.mop.state,'queued');
+});
+
+test('Area aliases that are ambiguous never select a conventional temperature sensor',()=>{
+  const reg=areaRegistries();
+  reg.areas.push({area_id:'second',name:'Kitchen',aliases:[]});
+  const model=buildModel({room:'kitchen'},hass(areaStates()),reg);
+  assert.equal(model.area.quality,'ambiguous');
+  assert.equal(model.temperature,null);
+  assert.equal(model.diagnostic.temperature.quality,'area-unresolved');
+});
