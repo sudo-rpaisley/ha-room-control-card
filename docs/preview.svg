@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 330" role="img" aria-labelledby="title desc">
+<title id="title">Room Control Card preview</title>
+<desc id="desc">A rounded Kitchen card showing vacuum, mop and temperature indicators alongside an Area mapping summary</desc>
+<rect x="0" y="0" width="760" height="330" rx="22" fill="#111827"/>
+<rect x="22" y="22" width="312" height="286" rx="20" fill="#242d3c" stroke="#667085" stroke-width="2"/>
+<text x="46" y="58" fill="#cbd5e1" font-family="sans-serif" font-size="16">Kitchen</text>
+<g transform="translate(238,38)"><circle cx="0" cy="0" r="13" fill="#f59e0b"/><text x="0" y="5" text-anchor="middle" fill="#111827" font-family="sans-serif" font-size="17">V</text><circle cx="40" cy="0" r="13" fill="#60a5fa"/><text x="40" y="5" text-anchor="middle" fill="#111827" font-family="sans-serif" font-size="17">M</text></g>
+<path d="M116 172 L178 109 L240 172 M134 161 V227 H222 V161 M159 227 V184 H195 V227" stroke="#93c5fd" stroke-width="11" stroke-linejoin="round" fill="none" stroke-linecap="round"/>
+<text x="46" y="277" fill="#cbd5e1" font-family="sans-serif" font-size="15">21.5 °C  ·  48 %</text>
+<text x="372" y="56" fill="#f8fafc" font-family="sans-serif" font-size="23" font-weight="bold">Area-first mapping</text>
+<text x="372" y="97" fill="#cbd5e1" font-family="sans-serif" font-size="17">Area: Kitchen</text>
+<text x="372" y="131" fill="#cbd5e1" font-family="sans-serif" font-size="17">Temperature: verified sensor</text>
+<text x="372" y="165" fill="#cbd5e1" font-family="sans-serif" font-size="17">Humidity: verified sensor</text>
+<text x="372" y="199" fill="#cbd5e1" font-family="sans-serif" font-size="17">Cleaning: queued / active / blocked</text>
+<rect x="368" y="228" width="345" height="54" rx="12" fill="#334155"/>
+<text x="386" y="260" fill="#93c5fd" font-family="sans-serif" font-size="16">Read-only discovery · safe actions</text>
+</svg>

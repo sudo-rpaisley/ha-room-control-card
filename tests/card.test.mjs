@@ -118,3 +118,66 @@ test('editor shows exact ambiguous Area sensor candidates rather than picking on
  assert.ok(editor.shadowRoot.innerHTML.includes('ambiguous'));
  assert.ok(editor.shadowRoot.innerHTML.includes('Refresh Area/Device/Entity registries'));
 });
+
+test('unrelated hass state changes do not rebuild the card, relevant changes do',()=>{
+  const {registry}=setup();const c=new (registry.get('room-control-card'))();
+  c.setConfig({room:'kitchen'});
+  const first=kitchen();const conn={};c.hass={states:first,connection:conn};
+  const marker=c.shadowRoot.innerHTML;
+  const originalQuery=c.shadowRoot;
+  // Detect rerenders by overriding the innerHTML setter on the test shadow root.
+  let renders=0,html=marker;
+  Object.defineProperty(originalQuery,'innerHTML',{configurable:true,get(){return html;},set(v){renders++;html=v;}});
+  c.hass={states:{...first,'sensor.irrelevant':{state:'on'}},connection:conn};
+  assert.equal(renders,0);
+  c.hass={states:{...first,'sensor.kitchen_multi_sensor_temperature':{state:'23.0'}},connection:conn};
+  assert.equal(renders,1);
+  assert.ok(c.shadowRoot.innerHTML.includes('23.0 °C'));
+});
+
+test('actions are discoverable when enabled and available, absent otherwise',()=>{
+  const {registry}=setup();const c=new (registry.get('room-control-card'))();
+  const states=kitchen();states['script.kitchen_on']={state:'off'};states['script.kitchen_off']={state:'off'};
+  c.setConfig({room:'kitchen',enable_actions:true});c.hass={states};
+  assert.ok(c.shadowRoot.innerHTML.includes('class="actions-toggle"'));
+  c._menu=true;c._render();
+  assert.ok(c.shadowRoot.innerHTML.includes('data-gesture="hold"'));
+  assert.ok(!c.shadowRoot.innerHTML.includes('data-gesture="double"')); // kitchen unsupported
+  c.setConfig({room:'kitchen'});c.hass={states};
+  assert.ok(!c.shadowRoot.innerHTML.includes('class="actions-toggle"'));
+});
+
+test('mapping wizard is visible and explicitly lists ambiguous climate candidates',async()=>{
+ const {registry}=setup();const editor=new (registry.get('room-control-card-editor'))();
+ editor.setConfig({room:'kitchen'});
+ const states=kitchen();states['sensor.first']={state:'18',attributes:{device_class:'temperature'}};
+ states['sensor.second']={state:'19',attributes:{device_class:'temperature'}};
+ const registries={
+  'config/area_registry/list':[{area_id:'kitchen',name:'Kitchen'}],
+  'config/device_registry/list':[],
+  'config/entity_registry/list':[{entity_id:'sensor.first',area_id:'kitchen'},{entity_id:'sensor.second',area_id:'kitchen'}]
+ };
+ editor.hass={states,connection:{},callWS:async x=>registries[x.type]};
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.ok(editor.shadowRoot.innerHTML.includes('Mapping wizard'));
+ assert.ok(editor.shadowRoot.innerHTML.includes('data-pick-id="sensor.first"'));
+ assert.ok(editor.shadowRoot.innerHTML.includes('data-pick-id="sensor.second"'));
+ assert.ok(editor.shadowRoot.innerHTML.includes('Shared profile sensor'));
+});
+
+test('wizard inventories devices inherited from the selected Area without controlling them',async()=>{
+ const {registry}=setup();const editor=new (registry.get('room-control-card-editor'))();
+ editor.setConfig({room:'kitchen'});
+ const states=kitchen();states['light.counter']={state:'on'};
+ const registryData={
+  'config/area_registry/list':[{area_id:'kitchen',name:'Kitchen'}],
+  'config/device_registry/list':[{id:'lightdev',area_id:'kitchen'}],
+  'config/entity_registry/list':[{entity_id:'light.counter',device_id:'lightdev',area_id:null}]
+ };
+ let actions=0;
+ editor.hass={states,connection:{},callWS:async x=>registryData[x.type],callService(){actions++;}};
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.ok(editor.shadowRoot.innerHTML.includes('Discovered room devices (1)'));
+ assert.ok(editor.shadowRoot.innerHTML.includes('light.counter'));
+ assert.equal(actions,0);
+});

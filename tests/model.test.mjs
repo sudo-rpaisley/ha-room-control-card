@@ -292,3 +292,79 @@ test('Area aliases that are ambiguous never select a conventional temperature se
   assert.equal(model.temperature,null);
   assert.equal(model.diagnostic.temperature.quality,'area-unresolved');
 });
+
+test('global profile sensor shares safe settings between cards; local bindings win',()=>{
+  const states=makeStates();
+  states['sensor.room_control_profiles']={state:'ready',attributes:{rooms:{kitchen:{
+    area_id:'kitchen', profile:{label:'Shared kitchen',icon:'mdi:pot-steam',vacuum:true,mop:true},
+    bindings:{temperature:'sensor.shared_temp',robot:'vacuum.s8_maxv_ultra'},enable_actions:true
+  }}}};
+  states['sensor.shared_temp']={state:'18.9',attributes:{device_class:'temperature'}};
+  const cfg={room:'kitchen',profiles_entity:'sensor.room_control_profiles'};
+  const model=buildModel(cfg,hass(states));
+  assert.equal(model.profile.label,'Shared kitchen');
+  assert.equal(model.temperature,'18.9');
+  assert.equal(model.shared.quality,'ok');
+  assert.equal(resolveAction(cfg,model,'hold',hass(states)),null); // shared config cannot enable commands
+  const local=buildModel({...cfg,profile:{label:'Local kitchen'},bindings:{temperature:'sensor.kitchen_multi_sensor_temperature'}},hass(states));
+  assert.equal(local.profile.label,'Local kitchen');
+  assert.equal(local.temperature,'21.2');
+  assert.equal(local.bindings.robot,'vacuum.s8_maxv_ultra');
+});
+
+test('missing, malformed and unsafe shared profiles fail closed to local defaults',()=>{
+  const states=makeStates();
+  const cfg={room:'kitchen',profiles_entity:'sensor.room_control_profiles'};
+  assert.equal(buildModel(cfg,hass(states)).shared.quality,'unavailable');
+  states['sensor.room_control_profiles']={state:'ready',attributes:{rooms:{kitchen:{profile:{path:'//bad.example'}}}}};
+  const result=buildModel(cfg,hass(states));
+  assert.equal(result.shared.quality,'invalid');
+  assert.equal(result.profile.path,'/lovelace/kitchen');
+  assert.throws(()=>validateConfig({room:'kitchen',profiles_entity:'vacuum.robot'}));
+  assert.throws(()=>validateConfig({room:'kitchen',profiles_entity:'sensor.foo;bad'}));
+});
+
+test('a wrong-domain entity, wrong device class or invalid humidity is not displayed',()=>{
+  const states=makeStates();
+  states['binary_sensor.illuminance']={state:'25'};
+  let m=buildModel({room:'kitchen',bindings:{temperature:'binary_sensor.illuminance'}},hass(states));
+  assert.equal(m.temperature,null);
+  assert.equal(m.diagnostic.temperature.quality,'wrong-domain');
+  states['sensor.kitchen_multi_sensor_temperature']={state:'22.1',attributes:{device_class:'humidity'}};
+  m=buildModel({room:'kitchen'},hass(states));
+  assert.equal(m.temperature,null);
+  assert.equal(m.diagnostic.temperature.quality,'wrong-device-class');
+  states['sensor.kitchen_multi_sensor_humidity']={state:'150',attributes:{device_class:'humidity'}};
+  m=buildModel({room:'kitchen'},hass(states));
+  assert.equal(m.humidity,null);
+  assert.equal(m.diagnostic.humidity.quality,'invalid-value');
+});
+
+test('profile metadata cannot make a new room control scripts unless local actions are enabled',()=>{
+  const states=makeStates('utility');
+  states['sensor.room_control_profiles']={state:'ready',attributes:{rooms:{utility:{
+    profile:{label:'Utility',double_tap:'vacuum'},enable_actions:true
+  }}}};
+  const cfg={room:'utility',profiles_entity:'sensor.room_control_profiles'};
+  const m=buildModel(cfg,hass(states));
+  assert.equal(resolveAction(cfg,m,'double',hass(states)),null);
+});
+
+test('a shared profile sensor accepts JSON text in attributes.rooms and rejects malformed JSON',()=>{
+  const states=makeStates();
+  const config={room:'kitchen',profiles_entity:'sensor.room_control_profiles'};
+  states['sensor.room_control_profiles']={state:'ready',attributes:{rooms:JSON.stringify({kitchen:{profile:{label:'Central Kitchen'}}})}};
+  assert.equal(buildModel(config,hass(states)).profile.label,'Central Kitchen');
+  states['sensor.room_control_profiles'].attributes.rooms='invalid json';
+  assert.equal(buildModel(config,hass(states)).shared.quality,'invalid');
+});
+
+test('unsafe shared profile types cannot enable action capabilities',()=>{
+ const s=makeStates();
+ s['sensor.room_control_profiles']={state:'ready',attributes:{rooms:{kitchen:{profile:{mop:'false',double_tap:'untrusted-script'}}}}};
+ const cfg={room:'kitchen',profiles_entity:'sensor.room_control_profiles'};
+ const m=buildModel(cfg,hass(s));
+ assert.equal(m.shared.quality,'invalid');
+ assert.equal(m.profile.doubleTap,'none');
+ assert.throws(()=>validateConfig({room:'kitchen',profile:{mop:'yes'}}));
+});

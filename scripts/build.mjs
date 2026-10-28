@@ -6,5 +6,5 @@ const model=readFileSync(resolve(root,'src/model.mjs'),'utf8').replace(/^export 
 const frontend=readFileSync(resolve(root,'src/card.js'),'utf8');
 const dest=resolve(root,'dist/ha-room-control-card.js');
 mkdirSync(dirname(dest),{recursive:true});
-writeFileSync(dest,`/* Room Control Card v0.2.0 — build from src; no external dependencies. */\n(()=>{\n'use strict';\n${model}\n${frontend}\n})();\n`);
+writeFileSync(dest,`/* Room Control Card v0.3.0 — build from src; no external dependencies. */\n(()=>{\n'use strict';\n${model}\n${frontend}\n})();\n`);
 console.log(`Built ${dest}`);
