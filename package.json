@@ -1,6 +1,6 @@
 {
   "name": "ha-room-control-card",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Room controls with validated Home Assistant bindings and Cassandra-compatible cleaning indicators",
   "type": "module",

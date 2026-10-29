@@ -72,6 +72,40 @@ export function discoverClimate(room, config, hass, registries) {
 export const BAD_STATES = new Set(['unknown', 'unavailable', '', null, undefined]);
 const ALLOWED_ROOM = /^[a-z][a-z0-9_]{0,63}$/;
 const ALLOWED_ENTITY = /^[a-z_]+\.[a-z0-9_]+$/;
+const SAFE_PATH = /^\/(?!\/)[a-zA-Z0-9/_-]+$/;
+
+/** Optional cross-dashboard profile source: a user-managed HA sensor with attributes.rooms.
+ * This only READS from HA state; it does not create an integration or persist profiles.
+ * Local per-card overrides always win. Never allow shared configuration to enable actions.
+ */
+export function effectiveConfig(config, hass) {
+  validateConfig(config);
+  const id=config.profiles_entity;
+  if(!id) return {config, shared:{quality:'not-configured'}};
+  const state=hass?.states?.[id];
+  if(!hass)return {config,shared:{quality:'pending',entity_id:id}};
+  if(!state || BAD_STATES.has(state.state))return {config,shared:{quality:'unavailable',entity_id:id}};
+  let rooms=state.attributes?.rooms;
+  if(typeof rooms==='string') {
+    try {rooms=JSON.parse(rooms);}catch {return {config,shared:{quality:'invalid',entity_id:id}};}
+  }
+  if(!rooms||typeof rooms!=='object'||Array.isArray(rooms))
+    return {config,shared:{quality:'invalid',entity_id:id}};
+  const roomSource=Object.hasOwn(rooms,config.room) ? rooms[config.room] : undefined;
+  if(roomSource===undefined)return {config,shared:{quality:'room-not-found',entity_id:id}};
+  if(!roomSource || typeof roomSource!=='object' || Array.isArray(roomSource))
+    return {config,shared:{quality:'invalid',entity_id:id}};
+  const profile=roomSource.profile||{};
+  const bindings=roomSource.bindings||{};
+  if(typeof profile!=='object'||Array.isArray(profile)||!bindings||typeof bindings!=='object'||Array.isArray(bindings))
+    return {config,shared:{quality:'invalid',entity_id:id}};
+  const merged={...config,area_id:config.area_id??roomSource.area_id,
+    profile:{...profile,...(config.profile||{})},bindings:{...bindings,...(config.bindings||{})}};
+  // Global profile cannot enable physical actions, choose a new room or redirect outside local paths.
+  if(!Object.hasOwn(config,'navigation_path'))delete merged.navigation_path;
+  try {validateConfig(merged);}catch {return {config,shared:{quality:'invalid',entity_id:id}};}
+  return {config:merged,shared:{quality:'ok',entity_id:id}};
+}
 
 export function getPreset(room, config = {}) {
   const saved = ROOM_PRESETS[room] || {};
@@ -101,8 +135,21 @@ export function validateConfig(config) {
   if(config.area_id !== undefined && (typeof config.area_id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(config.area_id))) {
     throw new Error('Room Control Card: area_id must be a Home Assistant area ID.');
   }
+  if(config.profiles_entity!==undefined && (typeof config.profiles_entity!=='string' || !ALLOWED_ENTITY.test(config.profiles_entity) || !config.profiles_entity.startsWith('sensor.'))) {
+    throw new Error('Room Control Card: profiles_entity must be a sensor entity ID.');
+  }
+  if(config.profile!==undefined){
+    const p=config.profile;
+    if(!p||typeof p!=='object'||Array.isArray(p))throw new Error('Room Control Card: profile must be an object.');
+    for(const key of ['vacuum','mop','bedtime','fan'])
+      if(p[key]!==undefined && typeof p[key]!=='boolean')throw new Error(`Room Control Card: profile.${key} must be true or false.`);
+    for(const key of ['label','icon'])
+      if(p[key]!==undefined && (typeof p[key]!=='string'||p[key].length>120))throw new Error(`Room Control Card: profile.${key} must be a short string.`);
+    if(p.double_tap!==undefined && !['none','bedtime','fan','vacuum'].includes(p.double_tap))
+      throw new Error('Room Control Card: unsupported double-tap profile action.');
+  }
   const path=config.navigation_path || config.profile?.path;
-  if (path && (!/^\/[a-zA-Z0-9/_-]+$/.test(path) || path.startsWith('//'))) {
+  if (path && !SAFE_PATH.test(path)) {
     throw new Error('Room Control Card: navigation path must be a local dashboard path.');
   }
   return true;
@@ -131,6 +178,8 @@ export function proposedBindings(room, profile) {
 
 export function resolveBindings(config, hass, registries = null) {
   validateConfig(config);
+  const effective=effectiveConfig(config,hass);
+  config=effective.config;
   const room=config.room, profile=getPreset(room,config);
   const states=hass?.states || {};
   const availableVacuumEntities=Object.keys(states).filter(id=>id.startsWith('vacuum.'));
@@ -177,7 +226,11 @@ export function resolveBindings(config, hass, registries = null) {
   for(const [role,id] of Object.entries(resolved)){
     const domain=id.split('.')[0];
     const entity=states[id];
-    const quality=domain!==BINDING_DOMAINS[role]?'wrong-domain':!hass?'pending':!entity?'missing':BAD_STATES.has(entity.state)?'unavailable':'ok';
+    const type=entity?.attributes?.device_class;
+    const numeric=(role==='temperature'||role==='humidity') && entity && !BAD_STATES.has(entity.state);
+    const wrongClass=numeric && type && type!==role;
+    const wrongNumber=numeric && (!Number.isFinite(Number(entity.state)) || (role==='humidity' && (Number(entity.state)<0 || Number(entity.state)>100)));
+    const quality=domain!==BINDING_DOMAINS[role]?'wrong-domain':!hass?'pending':!entity?'missing':BAD_STATES.has(entity.state)?'unavailable':wrongClass?'wrong-device-class':wrongNumber?'invalid-value':'ok';
     diagnostic[role]={entity_id:id,quality,explicit:Object.hasOwn(explicit,role),
       source:Object.hasOwn(explicit,role)?'manual':(suggestedSource[role]||'convention')};
   }
@@ -202,7 +255,7 @@ export function resolveBindings(config, hass, registries = null) {
   }
   // No robot => show a warning in cleaning status rather than selecting arbitrarily.
   if((profile.vacuum||profile.mop) && !resolved.robot){diagnostic.robot={entity_id:null,quality:'ambiguous-or-missing',explicit:false};}
-  return {room,profile,bindings:resolved,diagnostic,area:climate.area};
+  return {room,profile,bindings:resolved,diagnostic,area:climate.area,shared:effective.shared};
 }
 
 function stateOf(states,bindings,role) { return bindings[role] ? states[bindings[role]]?.state : undefined; }
@@ -212,9 +265,9 @@ function binary(s) { return s==='on'?true:s==='off'?false:null; }
 
 /** Read-only display model. A queued task does not imply active or completed. */
 export function buildModel(config, hass, registries = null) {
-  const {room,profile,bindings,diagnostic,area}=resolveBindings(config,hass,registries);
+  const {room,profile,bindings,diagnostic,area,shared}=resolveBindings(config,hass,registries);
   const states=hass?.states || {};
-  const val=(role)=>diagnostic[role]?.quality==='wrong-area'?undefined:stateOf(states,bindings,role);
+  const val=(role)=>diagnostic[role]?.quality==='ok'?stateOf(states,bindings,role):undefined;
   const robotStatus=val('robot_status');
   const robotState=val('robot');
   const confirmedCleaning = binary(val('robot_cleaning'))===true ||
@@ -251,7 +304,7 @@ export function buildModel(config, hass, registries = null) {
   const rawTemp=good(tempState)&&Number.isFinite(Number(tempState)) ? Number(tempState) : null;
   const rawHumidity=numberOf(val('humidity'));
   return {
-    room, profile, bindings, diagnostic, missing, area,
+    room, profile, bindings, diagnostic, missing, area, shared,
     roomOn:binary(val('room_state')), bedtime:binary(val('bedtime')),
     fan:binary(val('fan')),vacuum,mop,
     temperature:rawTemp===null?null:rawTemp.toFixed(1),

@@ -3,9 +3,41 @@
 A **Home Assistant custom dashboard card** with validated entity bindings, room navigation,
 and corner indicators for vacuuming, mopping, bedtime, extractor and temperature/humidity.
 
-**Status:** v0.1.0 development prototype. The JavaScript bundle and unit tests are working
+**Status:** v0.3.0 development pilot. The JavaScript bundle and unit tests are working
 locally, but **visual rendering and touchscreen interactions have not yet been validated on
 Home Assistant OS**. Do not install on a production Overview without a Dashboard Test pilot.
+
+![Room Control Card preview — illustrative, not a live Home Assistant screenshot](docs/preview.svg)
+
+This is an illustrative preview. The card still requires a **Dashboard Test** pilot
+for real HAOS rendering, room bindings and touch gestures.
+
+## v0.3.0 mapping wizard and shared profiles
+
+This pilot adds:
+
+- A guided Area → climate candidates → entity verification workflow in the graphical editor.
+- A **read-only Area device inventory** showing relevant lights, covers and sensors; these extra devices are not automatically controlled.
+- Optional `profiles_entity: sensor.room_control_profiles`, reading each room's centrally defined `area_id`, appearance and entity bindings from `attributes.rooms`.
+- Visible source and connection diagnostics, stronger type/value checks, fewer unnecessary re-renders and an optional button-based actions menu.
+- A licence and HACS preview illustration.
+
+The central profile sensor is user-managed, **not a graphical global profile
+database**. Local per-card settings override shared profiles; a shared profile
+cannot enable actions. Cassandra's scripts, queues and mobile notifications remain
+unchanged. See the [v0.3 shared-profile and wizard guide](docs/shared-profiles.md)
+and the [v0.2 Area mapping guide](docs/area-mapping.md).
+
+Example for a shared profile sensor:
+
+```yaml
+type: custom:room-control-card
+room: kitchen
+profiles_entity: sensor.room_control_profiles
+```
+
+The sensor must first be configured in Home Assistant as described in the guide;
+without it, ordinary Area-first card settings continue to work.
 
 ## Install via HACS (custom repository)
 
@@ -60,9 +92,7 @@ bindings:
   humidity: sensor.kitchen_humidity_primary
 ```
 
-A graphical editor is bundled and includes an optional Area selection for auditing
-**explicit** entity assignments (a device's inherited area may not show as a direct
-entity area). Area discovery does **not** automatically bind ambiguous entities.
+The graphical editor provides a guided Area mapping wizard and displays device-inherited Area assignments. It never selects among ambiguous climate sensors automatically.
 
 ### Supported room presets
 
@@ -119,8 +149,7 @@ profile:
   fan: false
 ```
 
-This pilot provides built-in defaults and per-card overrides, **not yet a
-shared room-profile database**. The next milestone is an optional companion HA
+This pilot supports built-in defaults, per-card overrides and an optional **read-only shared profile sensor**. A graphical profile manager with persistent storage still requires a companion integration. The next milestone is an optional companion HA
 integration for centrally storing profiles and exposing them to any card/dashboard.
 
 ## Area-first mapping (v0.2.0 pilot)
