@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {"user": {"title": "Room Control Profiles", "description": "Create a central, read-only room profile sensor. Add individual rooms under Configure after setup."}},
+    "abort": {"already_configured": "Room Control Profiles is already configured."}
+  },
+  "options": {
+    "step": {
+      "init": {"title": "Manage Room Profiles", "menu_options": {"add": "Add room", "edit": "Edit room", "remove": "Remove room"}},
+      "add": {"title": "Add room", "data": {"room": "Room key (e.g., kitchen)"}},
+      "edit": {"title": "Edit room", "data": {"room": "Existing room"}},
+      "remove": {"title": "Remove room", "data": {"room": "Existing room"}},
+      "confirm_remove": {"title": "Confirm removal of {room}", "data": {"confirm": "Delete profile (does not delete HA Area or devices)"}},
+      "details": {"title": "Room details: {room}", "data": {"area_id": "Home Assistant Area", "label": "Display name", "icon": "Room icon", "path": "Local dashboard navigation path", "vacuum": "Show vacuum indicator", "mop": "Show mop indicator", "bedtime": "Show bedtime indicator", "fan": "Show extractor indicator"}},
+      "climate": {"title": "Climate and room entities", "description": "Optional. Leave empty for safe Area-based climate discovery. No devices are changed.", "data": {"room_state": "Room state", "temperature": "Temperature", "humidity": "Humidity", "bedtime": "Bedtime helper", "fan": "Fan"}},
+      "cleaning": {"title": "Cleaning and shared robot bindings", "description": "Select only entities you have verified. Empty fields leave resolution to the card; this screen does not command the robot.", "data": {"robot": "Robot", "vacuum_queue": "Vacuum queued", "vacuum_active": "Vacuum active", "vacuum_days": "Vacuum days", "mop_queue": "Mop queued", "mop_active": "Mop active", "mop_days": "Mop days", "robot_status": "Robot status", "robot_cleaning": "Robot cleaning sensor", "water_shortage": "Water shortage", "mop_attached": "Mop attached", "water_box_attached": "Water box attached", "dock_error": "Dock error"}},
+      "robot_map": {"title": "Robot map reference (optional)", "description": "Metadata only. A nonzero segment ID requires explicit robot and map, plus manual confirmation. This does not control the robot.", "data": {"segment_id": "Segment number (0 = not configured)", "map_name": "Robot map name", "robot_entity_id": "Robot entity ID", "confirmed": "I have verified this segment on the selected robot map"}},
+      "review": {"title": "Save profile for {room}?", "description": "This updates the shared sensor. It does not operate devices, reset queues or send notifications.", "data": {"confirm": "Confirm and save"}}
+    },
+    "error": {"invalid_room": "Use a lower-case room key with underscores", "already_exists": "That room already exists", "unknown_area": "Select an existing Home Assistant Area", "invalid_profile": "One or more profile fields are invalid", "invalid_mapping": "Verify segment ID, map, robot entity and confirmation"}
+  }
+}

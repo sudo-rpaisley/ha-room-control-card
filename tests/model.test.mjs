@@ -28,6 +28,39 @@ function makeStates(room='kitchen') {
 }
 const hass=(states)=>({states});
 
+test('automatically discovers exactly one verified companion sensor',()=>{
+  const states=makeStates();
+  states['sensor.room_control_profiles']={state:'ready',attributes:{source:'room_control_profiles',schema_version:1,
+    rooms:{kitchen:{area_id:'kitchen',profile:{label:'My kitchen',icon:'mdi:fridge'},bindings:{robot:'vacuum.s8_maxv_ultra'}}}}};
+  const model=buildModel({room:'kitchen'},hass(states));
+  assert.equal(model.shared.quality,'ok');
+  assert.equal(model.shared.entity_id,'sensor.room_control_profiles');
+  assert.equal(model.profile.label,'My kitchen');
+});
+
+test('multiple marked companion sensors cannot be auto-selected',()=>{
+  const states=makeStates();
+  for(const id of ['sensor.room_control_profiles','sensor.room_control_profiles_2'])
+    states[id]={state:'ready',attributes:{source:'room_control_profiles',schema_version:1,rooms:{}}};
+  const model=buildModel({room:'kitchen'},hass(states));
+  assert.equal(model.shared.quality,'ambiguous');
+  assert.equal(model.profile.label,'Kitchen');
+});
+
+test('an explicit profile sensor wins over an automatically discovered companion',()=>{
+  const states=makeStates();
+  states['sensor.room_control_profiles']={state:'ready',attributes:{source:'room_control_profiles',schema_version:1,rooms:{kitchen:{profile:{label:'Companion'}}}}};
+  states['sensor.manual_profiles']={state:'ready',attributes:{rooms:{kitchen:{profile:{label:'Manual'}}}}};
+  const model=buildModel({room:'kitchen',profiles_entity:'sensor.manual_profiles'},hass(states));
+  assert.equal(model.profile.label,'Manual');
+});
+
+test('unrelated profile-like sensors without companion marker are ignored',()=>{
+  const states=makeStates();
+  states['sensor.random_profiles']={state:'ready',attributes:{rooms:{kitchen:{profile:{label:'Wrong'}}}}};
+  assert.equal(buildModel({room:'kitchen'},hass(states)).shared.quality,'not-configured');
+});
+
 test('six profiles reproduce existing mop eligibility, nav and corner capabilities',()=>{
   assert.deepEqual(Object.keys(ROOM_PRESETS),['kitchen','office','hall','bathroom','bedroom','livingroom']);
   assert.deepEqual(Object.keys(ROOM_PRESETS).filter(r=>ROOM_PRESETS[r].mop),['kitchen','hall']);
