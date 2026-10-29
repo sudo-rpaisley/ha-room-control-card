@@ -83,8 +83,13 @@ const SAFE_PATH = /^\/(?!\/)[a-zA-Z0-9/_-]+$/;
  */
 function effectiveConfig(config, hass) {
   validateConfig(config);
-  const id=config.profiles_entity;
-  if(!id) return {config, shared:{quality:'not-configured'}};
+  // Prefer an explicit user-managed sensor. Otherwise discover only an unambiguous
+  // companion sensor with the unique origin marker; do not adopt arbitrary sensors.
+  const managed=Object.entries(hass?.states || {}).filter(([entity,state])=>
+    entity.startsWith('sensor.') && state?.attributes?.source==='room_control_profiles' &&
+    state?.attributes?.schema_version===1).map(([entity])=>entity);
+  const id=config.profiles_entity || (managed.length===1 ? managed[0] : null);
+  if(!id) return {config, shared:{quality:managed.length>1?'ambiguous':'not-configured'}};
   const state=hass?.states?.[id];
   if(!hass)return {config,shared:{quality:'pending',entity_id:id}};
   if(!state || BAD_STATES.has(state.state))return {config,shared:{quality:'unavailable',entity_id:id}};
