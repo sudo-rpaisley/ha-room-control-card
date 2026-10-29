@@ -12,6 +12,36 @@ Home Assistant OS**. Do not install on a production Overview without a Dashboard
 This is an illustrative preview. The card still requires a **Dashboard Test** pilot
 for real HAOS rendering, room bindings and touch gestures.
 
+## Optional central Room Control Profiles integration (experimental)
+
+The source for an optional companion Home Assistant integration now lives under
+[`companion/`](companion/README.md). It adds a UI-based, persisted room-profile
+manager (Area selection, per-room entity pickers and optionally confirmed robot
+segment metadata), publishing a read-only `sensor.room_control_profiles` entity.
+
+**The HACS Dashboard card does NOT install this Python integration.** For an
+initial pilot, follow the manual VM installation instructions in
+[the companion README](companion/README.md); restart HA and add the integration
+under Settings → Devices & services. It must be separately packaged and
+validated before offering installation through HACS as an integration.
+
+With the companion installed and a single marked profiles sensor available,
+the card can automatically use centrally stored room profiles:
+
+```yaml
+type: custom:room-control-card
+room: kitchen
+```
+
+If several profile sensors exist or you want the current template-sensor approach,
+use `profiles_entity: sensor.your_profile_sensor` explicitly. Local card overrides
+still win. **No shared profile can enable device actions**; physical actions remain
+disabled unless a card has `enable_actions: true`. Cassandra's existing room
+verification, queues and notifications are not modified.
+
+This feature has offline tests but not yet a real HAOS runtime pilot. Test on
+**Dashboard Test** before changing Overview.
+
 ## v0.3.0 mapping wizard and shared profiles
 
 This pilot adds:
